@@ -169,3 +169,11 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+# Google Calendar Client Secret
+credentials.json
+token.pickle
+token.json
+
+# Temp LLM prompting file
+llm.txt
