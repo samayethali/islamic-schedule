@@ -21,7 +21,7 @@ DEFAULT_LOG_LEVEL = logging.INFO
 PRAYER_TIMES_DIR = 'prayer-times'
 CSV_DATE_FORMAT = '%d/%m/%Y'
 MAX_DATE_INPUT_ATTEMPTS = 5
-CSV_FILENAME_FORMAT = '%b-%Y.csv'  # e.g. 'apr-2024.csv'
+CSV_FILENAME_FORMAT = '%b-%Y.csv'  # e.g. 'apr-2025.csv'
 TOKEN_PATH = 'token.json'
 CREDENTIALS_PATH = 'credentials.json'
 LOG_FILE = 'calendar_sync.log'
@@ -51,6 +51,8 @@ class EventConfig:
     end_adjust: int
 
 
+# These configuration values are still used for offsetting.
+# (They are now used only for non-Tahajjud/Fajr events.)
 EVENT_CONFIGS = [
     EventConfig('Tahajjud', CSVColumn.FAJR_BEGINS, -40, 0),
     EventConfig('Fajr, Morning Adhkār, Habits', CSVColumn.FAJR_BEGINS, 0, 45),
@@ -102,23 +104,23 @@ def parse_time(time_str: str) -> Optional[datetime.time]:
         return None
 
 
-def round_time(time_obj: datetime.time, minutes: int = 5) -> datetime.time:
+def round_time(time_obj: datetime.time, round_to: int = 5) -> datetime.time:
     """Rounds a time object to the nearest specified minute interval."""
     total_minutes = time_obj.hour * 60 + time_obj.minute
-    rounded_total = round(total_minutes / minutes) * minutes
+    rounded_total = round(total_minutes / round_to) * round_to
     rounded_hour = (rounded_total // 60) % 24
     rounded_minute = rounded_total % 60
     return datetime.time(rounded_hour, rounded_minute)
 
 
-def adjust_time(time_str: str, adjustment: int) -> Optional[datetime.time]:
-    """Adjusts a time string by a specific number of minutes and rounds it."""
+def adjust_time_custom(time_str: str, adjustment: int, round_to: int) -> Optional[datetime.time]:
+    """Adjusts a time string by a specific number of minutes and rounds it to the specified interval."""
     base_time = parse_time(time_str)
     if not base_time:
         return None
     base_dt = datetime.datetime.combine(datetime.date.today(), base_time)
     adjusted_dt = base_dt + datetime.timedelta(minutes=adjustment)
-    return round_time(adjusted_dt.time())
+    return round_time(adjusted_dt.time(), round_to)
 
 
 class GoogleCalendarService:
@@ -239,7 +241,11 @@ def calculate_isha_end(
     start_date: datetime.date,
     end_date: datetime.date
 ) -> Optional[Tuple[datetime.time, datetime.time, datetime.date]]:
-    """Calculates Ishā end time."""
+    """Calculates Ishā End time.
+    
+    The start time is exactly the midpoint between Maghrib (of one day)
+    and Fajr (of the next day) with no rounding, and the end time is 15 minutes later.
+    """
     maghrib_dt = datetime.datetime.combine(event_date, maghrib_time, tzinfo=TIME_ZONE)
     next_day = event_date + datetime.timedelta(days=1)
     fajr_dt = datetime.datetime.combine(next_day, fajr_time, tzinfo=TIME_ZONE)
@@ -252,9 +258,10 @@ def calculate_isha_end(
     if not (start_date <= target_date <= end_date):
         logging.debug(f"Ishā End date {target_date} is out of range.")
         return None
+    # Do not round the midpoint; use it exactly.
     return (
-        round_time(midpoint.time()),
-        round_time(isha_end.time()),
+        midpoint.time(),
+        isha_end.time(),
         target_date
     )
 
@@ -268,20 +275,48 @@ def process_prayer_events(
     next_day_row: Optional[Dict[str, str]]
 ) -> None:
     """Processes and creates prayer time events for a specific date."""
-    # Create standard events
+    # Process each event from the configuration
     for config in EVENT_CONFIGS:
         time_str = row.get(config.csv_column.value, '').strip()
         if not time_str:
             logging.debug(f"No time data for '{config.summary}' on {event_date}")
             continue
-        start_time = adjust_time(time_str, config.start_adjust)
-        end_time = adjust_time(time_str, config.end_adjust)
+
+        # Special handling for Tahajjud
+        if config.summary == 'Tahajjud':
+            base_time = parse_time(time_str)
+            if not base_time:
+                continue
+            base_dt = datetime.datetime.combine(event_date, base_time)
+            # Start: 40 minutes before Fajr Begins, rounded to nearest 5 minutes.
+            start_time = round_time((base_dt + datetime.timedelta(minutes=-40)).time(), 5)
+            # End: exactly Fajr Begins (no rounding)
+            end_time = base_time
+
+        # Special handling for Fajr
+        elif config.summary.startswith('Fajr'):
+            base_time = parse_time(time_str)
+            if not base_time:
+                continue
+            # Start: exactly Fajr Begins (no rounding)
+            start_time = base_time
+            # End: 45 minutes after Fajr Begins, rounded to the nearest 15 minutes.
+            end_dt = datetime.datetime.combine(event_date, base_time) + datetime.timedelta(minutes=45)
+            end_time = round_time(end_dt.time(), 15)
+
+        # All other events: use the configured offsets and round to the nearest 15 minutes.
+        else:
+            start_time = adjust_time_custom(time_str, config.start_adjust, 15)
+            end_time = adjust_time_custom(time_str, config.end_adjust, 15)
+
         if not start_time or not end_time:
-            logging.debug(f"Skipping event '{config.summary}' due to invalid time.")
+            logging.debug(f"Skipping event '{config.summary}' due to invalid time for {event_date}")
             continue
+
         if not (start_date <= event_date <= end_date):
             logging.debug(f"Date {event_date} is outside the processing range.")
             continue
+
         create_event(
             service,
             config.summary,
@@ -291,7 +326,7 @@ def process_prayer_events(
             Color.LAVENDER
         )
 
-    # Handle Ishā End calculation
+    # Handle Ishā End calculation separately.
     maghrib_str = row.get(CSVColumn.MAGHRIB.value, '').strip()
     maghrib_time = parse_time(maghrib_str)
     if not maghrib_time:
