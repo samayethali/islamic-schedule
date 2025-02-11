@@ -58,7 +58,7 @@ EVENT_CONFIGS = [
     EventConfig('Fajr & Morning Adhkār', CSVColumn.FAJR_BEGINS, 0, 45),
     EventConfig('Lunch, News, Ẓuhr & Habits', CSVColumn.DHUR_JAMAT, -30, 60),
     EventConfig("'Aṣr & Evening Adhkār", CSVColumn.ASR_JAMAT, -15, 30),
-    EventConfig('Maghrib', CSVColumn.MAGHRIB, -10, 40),
+    EventConfig('Maghrib', CSVColumn.MAGHRIB, -10, 35),
     EventConfig("'Ishā & Qur'ān", CSVColumn.ISHA_JAMAT, -15, 30),
 ]
 
