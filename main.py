@@ -19,7 +19,7 @@ SCOPES = ['https://www.googleapis.com/auth/calendar']
 TIME_ZONE = ZoneInfo('Europe/London')
 DEFAULT_LOG_LEVEL = logging.INFO
 PRAYER_TIMES_DIR = 'prayer-times'
-CSV_DATE_FORMAT = '%d/%m/%Y'
+CSV_DATE_FORMAT = '%d %b'  # e.g. '01 Mar'
 MAX_DATE_INPUT_ATTEMPTS = 5
 CSV_FILENAME_FORMAT = '%b-%Y.csv'  # e.g. 'apr-2025.csv'
 TOKEN_PATH = 'token.json'
@@ -31,10 +31,15 @@ LOG_FILE = 'calendar_sync.log'
 class CSVColumn(Enum):
     DATE = 'Date'
     FAJR_BEGINS = 'Fajr Begins'
-    DHUR_JAMAT = 'Dhur Jamat'
-    ASR_JAMAT = 'Asr Jamat'
+    FAJR_JAMAAH = 'Fajr Jama\'ah'
+    SUNRISE = 'Sunrise'
+    DHUHR_BEGINS = 'Dhuhr Begins'
+    DHUHR_JAMAAH = 'Dhuhr Jama\'ah'
+    ASR_BEGINS = 'Asr Begins'
+    ASR_JAMAAH = 'Asr Jama\'ah'
     MAGHRIB = 'Maghrib'
-    ISHA_JAMAT = 'Isha Jamat'
+    ISHA_BEGINS = 'Isha\'a Begins'
+    ISHA_JAMAAH = 'Isha\'a Jama\'ah'
 
 
 # Event Colors
@@ -56,10 +61,10 @@ class EventConfig:
 EVENT_CONFIGS = [
     EventConfig('Tahajjud', CSVColumn.FAJR_BEGINS, -40, 0),
     EventConfig('Fajr & Morning Adhkār', CSVColumn.FAJR_BEGINS, 0, 45),
-    EventConfig('Lunch, News, Ẓuhr & Habits', CSVColumn.DHUR_JAMAT, -30, 60),
-    EventConfig("'Aṣr & Evening Adhkār", CSVColumn.ASR_JAMAT, -15, 30),
+    EventConfig('Lunch, News, Ẓuhr & Habits', CSVColumn.DHUHR_JAMAAH, -30, 60),
+    EventConfig("'Aṣr & Evening Adhkār", CSVColumn.ASR_JAMAAH, -15, 30),
     EventConfig('Maghrib', CSVColumn.MAGHRIB, -10, 35),
-    EventConfig("'Ishā & Qur'ān", CSVColumn.ISHA_JAMAT, -15, 30),
+    EventConfig("'Ishā & Qur'ān", CSVColumn.ISHA_JAMAAH, -15, 30),
 ]
 
 
@@ -98,10 +103,29 @@ def check_prayer_times_directory() -> None:
 def parse_time(time_str: str) -> Optional[datetime.time]:
     """Parses a time string into a datetime.time object."""
     try:
+        # Try parsing as 24-hour format first
         return datetime.datetime.strptime(time_str, '%H:%M').time()
-    except ValueError as e:
-        logging.error(f"Invalid time format '{time_str}': {e}")
-        return None
+    except ValueError:
+        try:
+            # If that fails, try 12-hour format
+            time_parts = time_str.split(':')
+            if len(time_parts) == 2:
+                hour = int(time_parts[0])
+                minute = int(time_parts[1])
+                
+                # Special handling for prayer times
+                # For Isha times (typically evening), 8:30 should be PM (20:30)
+                if hour == 8 or hour == 9:
+                    hour += 12
+                # For times 1-6, assume PM (13:00-18:00)
+                elif hour < 7 and hour != 12:
+                    hour += 12
+                
+                return datetime.time(hour, minute)
+        except (ValueError, IndexError) as e:
+            logging.error(f"Invalid time format '{time_str}': {e}")
+            return None
+    return None
 
 
 def round_time(time_obj: datetime.time, round_to: int = 5) -> datetime.time:
@@ -115,9 +139,12 @@ def round_time(time_obj: datetime.time, round_to: int = 5) -> datetime.time:
 
 def adjust_time_custom(time_str: str, adjustment: int, round_to: int) -> Optional[datetime.time]:
     """Adjusts a time string by a specific number of minutes and rounds it to the specified interval."""
+    # Use the parse_time function which now handles all special cases
     base_time = parse_time(time_str)
+    
     if not base_time:
         return None
+    
     base_dt = datetime.datetime.combine(datetime.date.today(), base_time)
     adjusted_dt = base_dt + datetime.timedelta(minutes=adjustment)
     return round_time(adjusted_dt.time(), round_to)
@@ -190,13 +217,24 @@ def load_csv_data(filename: str) -> Dict[datetime.date, Dict[str, str]]:
     """Loads CSV data into a dictionary mapped by date."""
     data: Dict[datetime.date, Dict[str, str]] = {}
     filepath = os.path.join(PRAYER_TIMES_DIR, filename)
+    
+    # Extract year from filename (e.g., 'mar-2025.csv' -> '2025')
+    try:
+        year_str = filename.split('-')[1].split('.')[0]
+        year = int(year_str)
+    except (IndexError, ValueError):
+        logging.error(f"Could not extract year from filename: {filename}")
+        return data
+    
     try:
         with open(filepath, 'r', encoding='utf-8') as csvfile:
             reader = csv.DictReader(csvfile)
             for row in reader:
                 date_str = row.get(CSVColumn.DATE.value, '').strip()
                 try:
-                    row_date = datetime.datetime.strptime(date_str, CSV_DATE_FORMAT).date()
+                    # Parse date with day and month only, then add the year
+                    date_obj = datetime.datetime.strptime(date_str, CSV_DATE_FORMAT)
+                    row_date = date_obj.replace(year=year).date()
                     data[row_date] = row
                 except ValueError:
                     logging.warning(f"Invalid date format in row: '{date_str}'")
@@ -207,19 +245,25 @@ def load_csv_data(filename: str) -> Dict[datetime.date, Dict[str, str]]:
 
 
 def create_event(
-    service: Resource,
+    service: Optional[Resource],
     summary: str,
     start_time: datetime.time,
     end_time: datetime.time,
     event_date: datetime.date,
-    color: Color
+    color: Color,
+    dry_run: bool = False
 ) -> bool:
     """Creates a Google Calendar event."""
+    start_dt = datetime.datetime.combine(event_date, start_time, tzinfo=TIME_ZONE)
+    end_dt = datetime.datetime.combine(event_date, end_time, tzinfo=TIME_ZONE)
+    if end_dt <= start_dt:
+        end_dt += datetime.timedelta(days=1)
+    
+    if dry_run:
+        logging.info(f"[DRY RUN] Would create event: '{summary}' on {event_date.strftime('%d %b %Y')} from {start_time} to {end_time}")
+        return True
+    
     try:
-        start_dt = datetime.datetime.combine(event_date, start_time, tzinfo=TIME_ZONE)
-        end_dt = datetime.datetime.combine(event_date, end_time, tzinfo=TIME_ZONE)
-        if end_dt <= start_dt:
-            end_dt += datetime.timedelta(days=1)
         event_body = {
             'summary': summary,
             'start': {'dateTime': start_dt.isoformat(), 'timeZone': TIME_ZONE.key},
@@ -227,7 +271,7 @@ def create_event(
             'colorId': color.value
         }
         service.events().insert(calendarId='primary', body=event_body).execute()
-        logging.info(f"Created event: '{summary}' on {event_date.strftime(CSV_DATE_FORMAT)}")
+        logging.info(f"Created event: '{summary}' on {event_date.strftime('%d %b %Y')}")
         return True
     except Exception as e:
         logging.error(f"Failed to create event '{summary}' on {event_date}: {e}")
@@ -266,13 +310,56 @@ def calculate_isha_end(
     )
 
 
+def convert_to_24h_format(time_str: str, prayer_type: str) -> Optional[datetime.time]:
+    """Converts a time string to 24-hour format based on prayer type."""
+    try:
+        # Parse the time string into hours and minutes
+        time_parts = time_str.split(':')
+        if len(time_parts) != 2:
+            raise ValueError(f"Invalid time format: {time_str}")
+        
+        hour = int(time_parts[0])
+        minute = int(time_parts[1])
+        
+        # Apply explicit conversion rules based on prayer type and hour
+        if prayer_type == 'fajr':
+            # Fajr is early morning (typically 4-6 AM)
+            # No conversion needed as it's already in 24-hour format
+            pass
+        elif prayer_type == 'dhuhr':
+            # Dhuhr is around noon/early afternoon
+            # Convert 1:15 to 13:15
+            if hour < 12:
+                hour += 12
+        elif prayer_type == 'asr':
+            # Asr is in the afternoon (typically 3-5 PM)
+            # Convert 3:49 to 15:49, 4:15 to 16:15
+            if hour < 12:
+                hour += 12
+        elif prayer_type == 'maghrib':
+            # Maghrib is in the evening (typically 5-7 PM)
+            # Convert 5:45 to 17:45
+            if hour < 12:
+                hour += 12
+        elif prayer_type == 'isha':
+            # Isha is at night (typically 8-10 PM)
+            # Convert 8:30 to 20:30
+            if hour < 12:
+                hour += 12
+        
+        return datetime.time(hour, minute)
+    except (ValueError, IndexError) as e:
+        logging.error(f"Invalid time format '{time_str}' for {prayer_type}: {e}")
+        return None
+
 def process_prayer_events(
-    service: Resource,
+    service: Optional[Resource],
     row: Dict[str, str],
     event_date: datetime.date,
     start_date: datetime.date,
     end_date: datetime.date,
-    next_day_row: Optional[Dict[str, str]]
+    next_day_row: Optional[Dict[str, str]],
+    dry_run: bool = False
 ) -> None:
     """Processes and creates prayer time events for a specific date."""
     # Process each event from the configuration
@@ -282,9 +369,20 @@ def process_prayer_events(
             logging.debug(f"No time data for '{config.summary}' on {event_date}")
             continue
 
+        # Determine prayer type for time conversion
+        prayer_type = 'fajr'
+        if 'Ẓuhr' in config.summary or 'Dhuhr' in config.summary:
+            prayer_type = 'dhuhr'
+        elif 'Aṣr' in config.summary or 'Asr' in config.summary:
+            prayer_type = 'asr'
+        elif 'Maghrib' in config.summary:
+            prayer_type = 'maghrib'
+        elif 'Ishā' in config.summary or 'Isha' in config.summary:
+            prayer_type = 'isha'
+
         # Special handling for Tahajjud
         if config.summary == 'Tahajjud':
-            base_time = parse_time(time_str)
+            base_time = convert_to_24h_format(time_str, 'fajr')
             if not base_time:
                 continue
             base_dt = datetime.datetime.combine(event_date, base_time)
@@ -295,7 +393,7 @@ def process_prayer_events(
 
         # Special handling for Fajr
         elif config.summary.startswith('Fajr'):
-            base_time = parse_time(time_str)
+            base_time = convert_to_24h_format(time_str, 'fajr')
             if not base_time:
                 continue
             # Start: exactly Fajr Begins (no rounding)
@@ -306,8 +404,14 @@ def process_prayer_events(
 
         # All other events: use the configured offsets and round to the nearest 15 minutes.
         else:
-            start_time = adjust_time_custom(time_str, config.start_adjust, 15)
-            end_time = adjust_time_custom(time_str, config.end_adjust, 15)
+            base_time = convert_to_24h_format(time_str, prayer_type)
+            if not base_time:
+                continue
+            base_dt = datetime.datetime.combine(event_date, base_time)
+            start_dt = base_dt + datetime.timedelta(minutes=config.start_adjust)
+            end_dt = base_dt + datetime.timedelta(minutes=config.end_adjust)
+            start_time = round_time(start_dt.time(), 15)
+            end_time = round_time(end_dt.time(), 15)
 
         if not start_time or not end_time:
             logging.debug(f"Skipping event '{config.summary}' due to invalid time for {event_date}")
@@ -323,12 +427,13 @@ def process_prayer_events(
             start_time,
             end_time,
             event_date,
-            Color.LAVENDER
+            Color.LAVENDER,
+            dry_run
         )
 
     # Handle Ishā End calculation separately.
     maghrib_str = row.get(CSVColumn.MAGHRIB.value, '').strip()
-    maghrib_time = parse_time(maghrib_str)
+    maghrib_time = convert_to_24h_format(maghrib_str, 'maghrib')
     if not maghrib_time:
         logging.debug(f"Invalid Maghrib time '{maghrib_str}' on {event_date}")
         return
@@ -338,7 +443,7 @@ def process_prayer_events(
         return
 
     fajr_str = next_day_row.get(CSVColumn.FAJR_BEGINS.value, '').strip()
-    fajr_time = parse_time(fajr_str)
+    fajr_time = convert_to_24h_format(fajr_str, 'fajr')
     if not fajr_time:
         logging.debug(f"Invalid Fajr time '{fajr_str}' for Ishā End calculation on {event_date}")
         return
@@ -352,15 +457,17 @@ def process_prayer_events(
             start_time,
             end_time,
             target_date,
-            Color.LAVENDER
+            Color.LAVENDER,
+            dry_run
         )
 
 
 def process_month(
-    service: Resource,
+    service: Optional[Resource],
     month_date: datetime.date,
     start_date: datetime.date,
-    end_date: datetime.date
+    end_date: datetime.date,
+    dry_run: bool = False
 ) -> datetime.date:
     """Processes prayer times for a given month."""
     current_filename = month_date.strftime(CSV_FILENAME_FORMAT).lower()
@@ -383,7 +490,8 @@ def process_month(
             current_date,
             start_date,
             end_date,
-            next_day_row
+            next_day_row,
+            dry_run
         )
         processed_dates += 1
     logging.info(f"Processed {processed_dates} days from {current_filename}")
@@ -395,7 +503,8 @@ def get_validated_date(prompt: str) -> datetime.date:
     for attempt in range(1, MAX_DATE_INPUT_ATTEMPTS + 1):
         date_str = input(prompt).strip()
         try:
-            return datetime.datetime.strptime(date_str, CSV_DATE_FORMAT).date()
+            # Keep using DD/MM/YYYY format for user input
+            return datetime.datetime.strptime(date_str, '%d/%m/%Y').date()
         except ValueError:
             print(f"Attempt {attempt}: Invalid format. Use DD/MM/YYYY.")
             logging.warning(f"Invalid date input: '{date_str}'")
@@ -403,13 +512,14 @@ def get_validated_date(prompt: str) -> datetime.date:
     sys.exit(1)
 
 
-def parse_command_line_args() -> Tuple[Optional[str], Optional[str]]:
-    """Parses command-line arguments for start and end dates."""
+def parse_command_line_args() -> Tuple[Optional[str], Optional[str], bool]:
+    """Parses command-line arguments for start and end dates and dry-run mode."""
     parser = argparse.ArgumentParser(description="Sync prayer times to Google Calendar.")
-    parser.add_argument('--start-date', type=str, help=f"Start date in {CSV_DATE_FORMAT} format.")
-    parser.add_argument('--end-date', type=str, help=f"End date in {CSV_DATE_FORMAT} format.")
+    parser.add_argument('--start-date', type=str, help="Start date in DD/MM/YYYY format.")
+    parser.add_argument('--end-date', type=str, help="End date in DD/MM/YYYY format.")
+    parser.add_argument('--dry-run', action='store_true', help="Process data without creating calendar events.")
     args = parser.parse_args()
-    return args.start_date, args.end_date
+    return args.start_date, args.end_date, args.dry_run
 
 
 def main() -> None:
@@ -417,17 +527,22 @@ def main() -> None:
     configure_logging()
     check_prayer_times_directory()
 
-    # Initialize Google Calendar service
-    calendar_service = GoogleCalendarService().service
-
     # Parse command-line arguments
-    cli_start_date, cli_end_date = parse_command_line_args()
+    cli_start_date, cli_end_date, dry_run = parse_command_line_args()
+
+    # Initialize Google Calendar service if not in dry-run mode
+    calendar_service = None
+    if not dry_run:
+        calendar_service = GoogleCalendarService().service
+    else:
+        logging.info("Running in dry-run mode. No calendar events will be created.")
 
     # Get user input if not provided via CLI
     if cli_start_date and cli_end_date:
         try:
-            start_date = datetime.datetime.strptime(cli_start_date, CSV_DATE_FORMAT).date()
-            end_date = datetime.datetime.strptime(cli_end_date, CSV_DATE_FORMAT).date()
+            # Use DD/MM/YYYY format for command line arguments
+            start_date = datetime.datetime.strptime(cli_start_date, '%d/%m/%Y').date()
+            end_date = datetime.datetime.strptime(cli_end_date, '%d/%m/%Y').date()
         except ValueError as e:
             logging.critical(f"Invalid date format in arguments: {e}")
             sys.exit(1)
@@ -443,7 +558,7 @@ def main() -> None:
     # Process each month within the date range
     current_month = start_date.replace(day=1)
     while current_month <= end_date.replace(day=1):
-        current_month = process_month(calendar_service, current_month, start_date, end_date)
+        current_month = process_month(calendar_service, current_month, start_date, end_date, dry_run)
 
 
 if __name__ == '__main__':
