@@ -59,12 +59,12 @@ class EventConfig:
 # These configuration values are still used for offsetting.
 # (They are now used only for non-Tahajjud/Fajr events.)
 EVENT_CONFIGS = [
-    EventConfig('Tahajjud', CSVColumn.FAJR_BEGINS, -40, 0),
+    EventConfig('Suḥūr', CSVColumn.FAJR_BEGINS, -40, 0),
     EventConfig('Fajr & Morning Adhkār', CSVColumn.FAJR_BEGINS, 0, 45),
-    EventConfig('Lunch, News, Ẓuhr & Habits', CSVColumn.DHUHR_JAMAAH, -30, 60),
-    EventConfig("'Aṣr & Evening Adhkār", CSVColumn.ASR_JAMAAH, -15, 30),
-    EventConfig('Maghrib', CSVColumn.MAGHRIB, -10, 35),
-    EventConfig("'Ishā & Qur'ān", CSVColumn.ISHA_JAMAAH, -15, 30),
+    EventConfig('Ẓuhr & News', CSVColumn.DHUHR_JAMAAH, -30, 60),
+    EventConfig("'Aṣr & Evening Adhkār", CSVColumn.ASR_JAMAAH, -60, -15),
+    EventConfig('Maghrib', CSVColumn.MAGHRIB, -10, 80),
+    EventConfig("'Ishā", CSVColumn.ISHA_JAMAAH, -15, 30),
 ]
 
 
@@ -380,8 +380,8 @@ def process_prayer_events(
         elif 'Ishā' in config.summary or 'Isha' in config.summary:
             prayer_type = 'isha'
 
-        # Special handling for Tahajjud
-        if config.summary == 'Tahajjud':
+        # Special handling for Suḥūr
+        if config.summary == 'Suḥūr':
             base_time = convert_to_24h_format(time_str, 'fajr')
             if not base_time:
                 continue
@@ -402,6 +402,29 @@ def process_prayer_events(
             end_dt = datetime.datetime.combine(event_date, base_time) + datetime.timedelta(minutes=45)
             end_time = round_time(end_dt.time(), 15)
 
+        # Special handling for Dhuhr in March 2025
+        elif 'Ẓuhr' in config.summary or 'Dhuhr' in config.summary:
+            # Check if the date is in March 2025
+            if event_date.month == 3 and event_date.year == 2025:
+                # Check if the day is Friday (weekday 4 in Python's datetime)
+                if event_date.weekday() == 4:  # Friday
+                    # Start at 12pm and last for 3 hours
+                    start_time = datetime.time(12, 0)
+                    end_time = datetime.time(15, 0)
+                else:
+                    # Start at 1pm and last for 2 hours
+                    start_time = datetime.time(13, 0)
+                    end_time = datetime.time(15, 0)
+            else:
+                # Use normal processing for other months
+                base_time = convert_to_24h_format(time_str, prayer_type)
+                if not base_time:
+                    continue
+                base_dt = datetime.datetime.combine(event_date, base_time)
+                start_dt = base_dt + datetime.timedelta(minutes=config.start_adjust)
+                end_dt = base_dt + datetime.timedelta(minutes=config.end_adjust)
+                start_time = round_time(start_dt.time(), 15)
+                end_time = round_time(end_dt.time(), 15)
         # All other events: use the configured offsets and round to the nearest 15 minutes.
         else:
             base_time = convert_to_24h_format(time_str, prayer_type)
@@ -431,6 +454,34 @@ def process_prayer_events(
             dry_run
         )
 
+    # Handle Tarāwīḥ event (1 hour duration, ending at Suḥūr time)
+    fajr_str = row.get(CSVColumn.FAJR_BEGINS.value, '').strip()
+    if fajr_str:
+        fajr_time = convert_to_24h_format(fajr_str, 'fajr')
+        if fajr_time:
+            # Calculate Suḥūr start time (40 minutes before Fajr)
+            fajr_dt = datetime.datetime.combine(event_date, fajr_time)
+            suhur_start_dt = fajr_dt + datetime.timedelta(minutes=-40)
+            suhur_start_time = round_time(suhur_start_dt.time(), 5)
+            
+            # Calculate Tarāwīḥ start time (1 hour before Suḥūr starts)
+            tarawih_start_dt = suhur_start_dt + datetime.timedelta(minutes=-60)
+            tarawih_start_time = round_time(tarawih_start_dt.time(), 5)
+            
+            # Tarāwīḥ ends when Suḥūr starts
+            tarawih_end_time = suhur_start_time
+            
+            # Create Tarāwīḥ event
+            create_event(
+                service,
+                'Tarāwīḥ',
+                tarawih_start_time,
+                tarawih_end_time,
+                event_date,
+                Color.LAVENDER,
+                dry_run
+            )
+    
     # Handle Ishā End calculation separately.
     maghrib_str = row.get(CSVColumn.MAGHRIB.value, '').strip()
     maghrib_time = convert_to_24h_format(maghrib_str, 'maghrib')
